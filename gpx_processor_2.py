@@ -19,7 +19,7 @@ python3 gpx_processor.py explore2025.gpx explore2025_clean.gpx --start 2025-05-0
 python3 gpx_processor.py WaypointsRoutesTracks2025.gpx WaypointsRoutesTracks2025_clean.gpx --start 2025-05-01T00:00:00 --end 2025-10-01T23:59:59 --timezone Europe/Istanbul --timedelta -3 --join --clean --simplify 5
 python3 gpx_processor.py WaypointsRoutesTracks2025_clean.gpx summer2025_clean.gpx --backup explore2025_clean.gpx --gap 600
 # The merge algorithm assumes single segments, so split last
-python3 gpx_processor.py summer2025_clean.gpx summer2025.gpx --split --waypoints summer2025_waypoints_annotated.gpx
+python3 gpx_processor.py summer2025_clean.gpx summer2025.gpx --split
 """
 
 import xml.etree.ElementTree as ET
@@ -150,7 +150,7 @@ class Track:
         for segment in self.segments:
             # Any two points less than prune_distance and prune_duration apart (in space and time)
             # will disqualify all the points in between. So this is our first pass:
-            # TODO(martin): Not yet implemented
+            fo r
             
     def fill_gaps(self, other, gap_threshold: timedelta):
         filled_segments = []
@@ -195,7 +195,7 @@ def parse_waypoint(wpt_elem, timezone=None, delta=timedelta()):
     sog = float(sog_elem.text) if sog_elem is not None else None
     time_elem = wpt_elem.find('gpx:time', ns)
     time = dateutil.parser.isoparse(time_elem.text) if time_elem is not None else None
-    if time and timezone:
+    if timezone:
         time = time.astimezone(timezone) + delta
 
     return Waypoint(lat, lon, elevation, name, sog, time)
@@ -231,11 +231,8 @@ def read_gpx(filename, timezone=None, delta=timedelta()):
 
     return gpx
 
-def create_waypoint_elem(wpt, tag='wpt', number=None):
+def create_waypoint_elem(wpt, tag='wpt'):
     wpt_elem = ET.Element(tag, {'lat': str(wpt.lat), 'lon': str(wpt.lon)})
-    # we don't preserve original numbers, just generate consecutive values
-    if number is not None:
-        ET.SubElement(wpt_elem, 'number').text = str(number)
     if wpt.elevation is not None:
         ET.SubElement(wpt_elem, 'ele').text = str(wpt.elevation)
     if wpt.name is not None:
@@ -256,13 +253,11 @@ def write_gpx(gpx, filename):
         'xmlns': 'http://www.topografix.com/GPX/1/1'
     })
 
-    for (i_wpt, wpt) in enumerate(gpx.waypoints):
-        root.append(create_waypoint_elem(wpt, number=i_wpt))
+    for wpt in gpx.waypoints:
+        root.append(create_waypoint_elem(wpt))
 
-    for (i_rte, rte) in enumerate(gpx.routes):
+    for rte in gpx.routes:
         rte_elem = ET.SubElement(root, 'rte')
-        # we always generate consecutive values for `number` field
-        ET.SubElement(rte_elem, 'number').text = str(i_rte)
         if rte.name is not None:
             ET.SubElement(rte_elem, 'name').text = rte.name
         if rte.description is not None:
@@ -270,10 +265,8 @@ def write_gpx(gpx, filename):
         for rtept in rte.points:
             rte_elem.append(create_waypoint_elem(rtept, 'rtept'))
 
-    for (i_trk, trk) in enumerate(gpx.tracks):
+    for trk in gpx.tracks:
         trk_elem = ET.SubElement(root, 'trk')
-        # we always generate consecutive values for `number` field
-        ET.SubElement(trk_elem, 'number').text = str(i_trk)
         if trk.name is not None:
             ET.SubElement(trk_elem, 'name').text = trk.name
         if trk.description is not None:
@@ -314,7 +307,7 @@ def run_tests():
 
 def read_and_process(input_file, timezone, args):
     # Read GPX file
-    gpx_data = read_gpx(input_file, timezone=timezone, delta=args.timedelta)
+    gpx_data = read_gpx(input_file, timezone=timezone, delta=args.delta)
 
     # Remove routes and waypoints
     gpx_data.waypoints.clear()
@@ -323,7 +316,7 @@ def read_and_process(input_file, timezone, args):
     # remove anything too early or late
     gpx_data.tracks = [track for track in gpx_data.tracks if track.is_within(args.start, args.end)]
 
-    if args.join:
+    if ars.join:
         combined_track = Track()
         all_segments = sorted([segment for track in gpx_data.tracks for segment in track.segments], key=lambda x: x[0].time)
         combined_segment = sum(all_segments, [])
@@ -337,9 +330,9 @@ def read_and_process(input_file, timezone, args):
         if args.simplify is not None:
             track.simplify(args.simplify)
 
-        # if args.prune:
-        #     track.prune(distance=args.prune_distance, duration=args.prune_duration,
-        #                 count=args.prune_count)
+        if args.prune:
+            track.prune(distance=args.prune_distance, duration=args.prune_duration,
+                        count=args.prune_count)
 
     if args.split:
         day_segments = defaultdict(list)
@@ -353,12 +346,6 @@ def read_and_process(input_file, timezone, args):
             day_track.name = str(date)
             day_track.segments.append(day_segment)
             day_tracks.append(day_track)
-            if args.split_waypoints:
-                # add waypoint at end of each day segment (probably just one segment)
-                gpx_data.waypoints.append(Waypoint(
-                    lat=day_segment[-1].lat,
-                    lon=day_segment[-1].lon,
-                    name=day_track.name))
         gpx_data.tracks = day_tracks
 
     return gpx_data
@@ -378,21 +365,18 @@ def main():
     parser.add_argument("--timedelta", default=0.0, type=float, help="Time delta in hours")
     parser.add_argument("--join", action="store_true", default=False, help="Combine all tracks")
     parser.add_argument("--split", action="store_true", default=False, help="Split tracks by day")
-    parser.add_argument("--split-waypoints", action="store_true", default=False,
-                        help="Emit a waypoint for each end of day")
     parser.add_argument("--clean", action="store_true", default=False,
                         help="Remove points with the exact same timestamp as a previous trackpoint")
     parser.add_argument("--simplify", type=float, default=None,
                         help="Remove point sequences with area less than a threshold in square meters")
-    # parser.add_argument("--prune", action="store_true", default=False, help="Prune idle time")
-    # parser.add_argument("--prune-distance", type=float, default=100,
-    #                     help="All points must be within this distance in meters to prune")
-    # parser.add_argument("--prune-duration", type=float, default=3600,
-    #                     help="All points must be within this time in seconds to prune")
-    # parser.add_argument("--prune-count", type=float, default=None,
-    #                     help="Must have a least this many points to prune")
+    parser.add_argument("--prune", action="store_true", default=False, help="Prune idle time")
+    parser.add_argument("--prune-distance", type=float, default=100,
+                        help="All points must be within this distance in meters to prune")
+    parser.add_argument("--prune-duration", type=float, default=3600,
+                        help="All points must be within this time in seconds to prune")
+    parser.add_argument("--prune-count", type=float, default=None,
+                        help="Must have a least this many points to prune")
     parser.add_argument("--backup", default=None, help="Backup track data to fill gaps")
-    parser.add_argument("--waypoints", default=None, help="File with waypoints to add")
     parser.add_argument("--gap", type=float, default=300,
                         help="Minimum gap in seconds to fill from backup")
     args = parser.parse_args()
@@ -404,7 +388,7 @@ def main():
         args.end = args.end.astimezone(tz)
     args.timedelta = timedelta(hours=args.timedelta)
     
-    gpx_data = read_and_process(args.input_file, timezone=tz, args=args)
+    gpx_data = read_and_process(args.input_file, args)
     if args.backup:
         backup_args = args.copy()
         backup_args.split = False
@@ -416,10 +400,6 @@ def main():
             for backup_track in backup_data.tracks:
                 print("Calling fill_gaps()")
                 track.fill_gaps(backup_track, gap_threshold=timedelta(seconds=args.gap))
-
-    if args.waypoints:
-        waypoint_data = read_gpx(args.waypoints, timezone=tz, delta=args.timedelta)
-        gpx_data.waypoints.extend(waypoint_data.waypoints)
 
     # Write modified data to a new GPX file
     write_gpx(gpx_data, args.output_file)
