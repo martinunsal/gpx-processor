@@ -1,8 +1,10 @@
 """
-Process GPX files from chartplotter and/or Inreach MINI
+Process GPX files from chartplotter and/or Inreach MINI.
+Output format is determined by the output file extension: .gpx writes GPX, .kml writes KML.
 
 Examples:
 python3 gpx_processor.py WaypointsRoutesTracks.gpx out.gpx --start 2024-07-01T00:00:00 --end 2024-12-31T23:59:59 --timezone Europe/Istanbul
+python3 gpx_processor.py WaypointsRoutesTracks.gpx out.kml --start 2024-07-01T00:00:00 --end 2024-12-31T23:59:59 --timezone Europe/Istanbul
 python3 gpx_processor.py explore_including_belize.gpx belize.gpx --start 2024-12-01T00:00:00 --end 2025-10-01T23:59:59 --timezone America/Belize --join --split
 python3 gpx_processor.py WaypointsRoutesTracks3.gpx turkey.gpx --start 2024-08-01T00:00:00 --end 2024-10-01T23:59:59 --timezone Europe/Istanbul --join --split --clean --simplify 4
 
@@ -20,6 +22,8 @@ python3 gpx_processor.py WaypointsRoutesTracks2025.gpx WaypointsRoutesTracks2025
 python3 gpx_processor.py WaypointsRoutesTracks2025_clean.gpx summer2025_clean.gpx --backup explore2025_clean.gpx --gap 600
 # The merge algorithm assumes single segments, so split last
 python3 gpx_processor.py summer2025_clean.gpx summer2025.gpx --split --waypoints summer2025_waypoints_annotated.gpx
+# Export to KML for Google Earth Pro
+python3 gpx_processor.py summer2025.gpx summer2025.kml
 """
 
 import xml.etree.ElementTree as ET
@@ -27,12 +31,28 @@ from xml.dom import minidom
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import math
-from zoneinfo import ZoneInfo # pip3 install backports-zoneinfo 
+from zoneinfo import ZoneInfo # pip3 install backports-zoneinfo
 import dateutil # pip3 install python-dateutil
+from pyproj import Geod # pip3 install pyproj
 from collections import defaultdict
 from typing import List, Dict, Type
 import argparse
 import functools
+
+# Custom GPX extension namespace for storing track colors
+EXT_NS = 'https://gpx-processor/v1'
+ET.register_namespace('ext', EXT_NS)
+
+# Named color palettes: hex RGB strings (RRGGBB)
+PALETTES: Dict[str, List[str]] = {
+    'rainbow': ['FF0000', 'FF7F00', 'FFFF00', '00FF00', '0000FF', '8B00FF'],
+    'redgreen': ['d53e4f', 'f46d43', 'fdae61', 'fee08b', 'e6f598', 'abdda4', '66c2a5']
+}
+
+def rgb_to_kml(rgb: str) -> str:
+    """Convert RRGGBB hex string to KML color format aabbggrr (fully opaque)."""
+    r, g, b = rgb[0:2], rgb[2:4], rgb[4:6]
+    return f'ff{b}{g}{r}'.lower()
 
 @dataclass
 class Waypoint:
@@ -74,10 +94,51 @@ class Waypoint:
 
         # Convert the area from degrees squared to meters squared
         R = 6371000  # Radius of the Earth in meters
-        area *= (math.radians(R) ** 2) * math.cos(lat_mean)
+        area *= (math.radians(R) ** 2) * math.cos(math.radians(lat_mean))
 
         return area
 
+    @staticmethod
+    def calculate_geodesic_area(waypoints: List['Waypoint']) -> float:
+        """Calculate the geodesic area of a polygon in meters² using the WGS84 ellipsoid (via pyproj).
+
+        More accurate than calculate_area for large polygons or high latitudes, at higher
+        computational cost. Suitable as a reference for validating calculate_area.
+        """
+        geod = Geod(ellps='WGS84')
+        lons = [w.lon for w in waypoints]
+        lats = [w.lat for w in waypoints]
+        area, _ = geod.polygon_area_perimeter(lons, lats)
+        return abs(area)
+
+    @staticmethod
+    def calculate_all_signed_areas(waypoints: List['Waypoint']) -> List[float]:
+        """Return a list where areas[i] is the signed shoelace area of waypoints[0..i] (in degrees²).
+
+        Each consecutive cross-product is computed exactly once and accumulated.
+        The closing term (last point → first point) is O(1) to update per step.
+        Areas[0] and areas[1] are 0.0 (fewer than 3 points cannot form a polygon).
+        """
+        n = len(waypoints)
+        areas = [0.0] * n
+        if n < 3:
+            return areas
+
+        lat0, lon0 = waypoints[0].lat, waypoints[0].lon
+        # Seed with cp_0: cross product of the edge p0→p1
+        cumsum = lat0 * waypoints[1].lon - waypoints[1].lat * lon0
+
+        for i in range(2, n):
+            lat_prev, lon_prev = waypoints[i - 1].lat, waypoints[i - 1].lon
+            lat_i,    lon_i    = waypoints[i].lat,     waypoints[i].lon
+            # Accumulate cp_{i-1}: cross product of edge p_{i-1}→p_i
+            cumsum += lat_prev * lon_i - lat_i * lon_prev
+            # Closing term: edge p_i→p_0
+            closing = lat_i * lon0 - lat0 * lon_i
+            areas[i] = 0.5 * (cumsum + closing)
+
+        return areas
+    
 
 @dataclass
 class Route:
@@ -90,6 +151,7 @@ class Track:
     name: str = None
     description: str = None
     segments: List[List[Waypoint]] = field(default_factory=list)
+    color: str = None  # hex RGB, e.g. "FF0000"; applies to all segments in this track
 
     def is_within(self, start: datetime = None, end: datetime = None):
         for segment in self.segments:
@@ -118,7 +180,7 @@ class Track:
         """Greedily remove maximal sequences of waypoints whose area is less
         than a given threshold"""
         simplified_segments = []
-        max_simplify = 10
+        max_simplify = 1
         for segment in self.segments:
             simplified_segment = [segment[0]]
             try_waypoints = [segment[0], segment[1]]
@@ -145,12 +207,12 @@ class Track:
             simplified_segments.append(simplified_segment)
         self.segments = simplified_segments
 
-    def prune(distance=args.prune_distance, duration=args.prune_duration,
-                        count=args.prune_count):
+    def prune(self, distance=None, duration=None, count=None):
         for segment in self.segments:
             # Any two points less than prune_distance and prune_duration apart (in space and time)
             # will disqualify all the points in between. So this is our first pass:
             # TODO(martin): Not yet implemented
+            pass
             
     def fill_gaps(self, other, gap_threshold: timedelta):
         filled_segments = []
@@ -222,6 +284,11 @@ def read_gpx(filename, timezone=None, delta=timedelta()):
         track = Track()
         track.name = trk.find('gpx:name', ns).text if trk.find('gpx:name', ns) is not None else None
         track.description = trk.find('gpx:desc', ns).text if trk.find('gpx:desc', ns) is not None else None
+        ext = trk.find('gpx:extensions', ns)
+        if ext is not None:
+            color_elem = ext.find(f'{{{EXT_NS}}}color')
+            if color_elem is not None:
+                track.color = color_elem.text
         for trkseg in trk.findall('gpx:trkseg', ns):
             segment = []
             for trkpt in trkseg.findall('gpx:trkpt', ns):
@@ -247,6 +314,61 @@ def create_waypoint_elem(wpt, tag='wpt', number=None):
     #    if wpt.description is not None:
     #        ET.SubElement(wpt_elem, 'desc').text = wpt.description
     return wpt_elem
+
+
+def write_kml(gpx, filename):
+    root = ET.Element('kml', {'xmlns': 'http://www.opengis.net/kml/2.2'})
+    doc = ET.SubElement(root, 'Document')
+
+    if gpx.waypoints:
+        folder = ET.SubElement(doc, 'Folder')
+        ET.SubElement(folder, 'name').text = 'Waypoints'
+        for wpt in gpx.waypoints:
+            pm = ET.SubElement(folder, 'Placemark')
+            if wpt.name:
+                ET.SubElement(pm, 'name').text = wpt.name
+            point = ET.SubElement(pm, 'Point')
+            ele = wpt.elevation if wpt.elevation is not None else 0
+            ET.SubElement(point, 'coordinates').text = f'{wpt.lon},{wpt.lat},{ele}'
+
+    if gpx.routes:
+        folder = ET.SubElement(doc, 'Folder')
+        ET.SubElement(folder, 'name').text = 'Routes'
+        for rte in gpx.routes:
+            pm = ET.SubElement(folder, 'Placemark')
+            if rte.name:
+                ET.SubElement(pm, 'name').text = rte.name
+            ls = ET.SubElement(pm, 'LineString')
+            ET.SubElement(ls, 'tessellate').text = '1'
+            ET.SubElement(ls, 'coordinates').text = ' '.join(
+                f'{pt.lon},{pt.lat},{pt.elevation if pt.elevation is not None else 0}'
+                for pt in rte.points
+            )
+
+    if gpx.tracks:
+        folder = ET.SubElement(doc, 'Folder')
+        ET.SubElement(folder, 'name').text = 'Tracks'
+        for trk in gpx.tracks:
+            pm = ET.SubElement(folder, 'Placemark')
+            if trk.name:
+                ET.SubElement(pm, 'name').text = trk.name
+            if trk.color:
+                style = ET.SubElement(pm, 'Style')
+                line_style = ET.SubElement(style, 'LineStyle')
+                ET.SubElement(line_style, 'color').text = rgb_to_kml(trk.color)
+                ET.SubElement(line_style, 'width').text = '5'
+            geom = ET.SubElement(pm, 'MultiGeometry')
+            for segment in trk.segments:
+                ls = ET.SubElement(geom, 'LineString')
+                ET.SubElement(ls, 'tessellate').text = '1'
+                ET.SubElement(ls, 'coordinates').text = ' '.join(
+                    f'{pt.lon},{pt.lat},{pt.elevation if pt.elevation is not None else 0}'
+                    for pt in segment
+                )
+
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="\t", level=0)
+    tree.write(filename, encoding='utf-8', xml_declaration=True)
 
 
 def write_gpx(gpx, filename):
@@ -278,6 +400,9 @@ def write_gpx(gpx, filename):
             ET.SubElement(trk_elem, 'name').text = trk.name
         if trk.description is not None:
             ET.SubElement(trk_elem, 'desc').text = trk.description
+        if trk.color is not None:
+            ext_elem = ET.SubElement(trk_elem, 'extensions')
+            ET.SubElement(ext_elem, f'{{{EXT_NS}}}color').text = trk.color
         for segment in trk.segments:
             trkseg_elem = ET.SubElement(trk_elem, 'trkseg')
             for trkpt in segment:
@@ -292,25 +417,6 @@ def write_gpx(gpx, filename):
     # xmlstr = minidom.parseString(ET.tostring(root)).toprettyxml(indent="   ")
     #with open(filename, "w") as f:
     #    f.write(xmlstr)
-
-def run_tests():
-    waypoints = [
-        Waypoint(lat=36.94588261, lon=28.09343972),
-        Waypoint(lat=36.94588981, lon=28.09331353),
-        Waypoint(lat=36.94588261, lon=28.0932955)
-    ]
-    area = Waypoint.calculate_area(waypoints)
-    assert area - 4.682014129243959 < 1e-10
-
-    waypoints = [
-        Waypoint(lat=36.92415369, lon=28.1621126),
-        Waypoint(lat=36.9241681, lon=28.1621126),
-        Waypoint(lat=36.92424736, lon=28.1621126),
-        Waypoint(lat=36.9242978, lon=28.1621126),
-        Waypoint(lat=36.92430501, lon=28.1621126)
-    ]
-    area = Waypoint.calculate_area(waypoints)
-    assert area == 0.0
 
 def read_and_process(input_file, timezone, args):
     # Read GPX file
@@ -365,8 +471,6 @@ def read_and_process(input_file, timezone, args):
 
 
 def main():
-    run_tests()
-
     parser = argparse.ArgumentParser(description="Process GPX files")
     parser.add_argument("input_file", help="Input GPX file to process")
     parser.add_argument("output_file", help="Output GPX file to write")
@@ -391,6 +495,10 @@ def main():
     #                     help="All points must be within this time in seconds to prune")
     # parser.add_argument("--prune-count", type=float, default=None,
     #                     help="Must have a least this many points to prune")
+    parser.add_argument("--color", nargs='?', const='rainbow', default=None,
+                        metavar='PALETTE',
+                        help=f"Color each track from a named palette (default: rainbow). "
+                             f"Available: {', '.join(PALETTES)}")
     parser.add_argument("--backup", default=None, help="Backup track data to fill gaps")
     parser.add_argument("--waypoints", default=None, help="File with waypoints to add")
     parser.add_argument("--gap", type=float, default=300,
@@ -421,8 +529,19 @@ def main():
         waypoint_data = read_gpx(args.waypoints, timezone=tz, delta=args.timedelta)
         gpx_data.waypoints.extend(waypoint_data.waypoints)
 
-    # Write modified data to a new GPX file
-    write_gpx(gpx_data, args.output_file)
+    if args.color:
+        palette = PALETTES.get(args.color)
+        if palette is None:
+            parser.error(f"Unknown palette '{args.color}'. Available: {', '.join(PALETTES)}")
+        for i, track in enumerate(gpx_data.tracks):
+            track.color = palette[i % len(palette)]
+
+    # Write output — format determined by output file extension
+    ext = args.output_file.rsplit('.', 1)[-1].lower()
+    if ext == 'kml':
+        write_kml(gpx_data, args.output_file)
+    else:
+        write_gpx(gpx_data, args.output_file)
 
     print(f"Processed {args.input_file} and wrote results to {args.output_file}")
 
