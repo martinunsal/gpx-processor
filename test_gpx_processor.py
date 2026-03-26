@@ -1,5 +1,5 @@
 """
-Unit tests for gpx_processor.py — GPX read/write roundtrip tests.
+Unit tests for gpx_processor.py - GPX read/write roundtrip tests.
 
 Run with:
     python3 -m pytest test_gpx_processor.py -v
@@ -115,7 +115,7 @@ class TestReadGPX(unittest.TestCase):
         self.assertEqual(len(trk.segments[1]), 2)
 
     def test_read_optional_fields_absent(self):
-        """Waypoint with only lat/lon — all optional fields should be None."""
+        """Waypoint with only lat/lon - all optional fields should be None."""
         xml = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1">
@@ -196,7 +196,7 @@ class TestWriteGPX(unittest.TestCase):
 class TestCalculateAllSignedAreas(unittest.TestCase):
 
     def _make_square(self, side=1.0):
-        """A square with vertices at (0,0),(side,0),(side,side),(0,side). Area = side²."""
+        """A square with vertices at (0,0),(side,0),(side,side),(0,side)."""
         return [
             Waypoint(lat=0.0,    lon=0.0),
             Waypoint(lat=side,   lon=0.0),
@@ -213,35 +213,29 @@ class TestCalculateAllSignedAreas(unittest.TestCase):
             self.assertTrue(all(a == 0.0 for a in areas))
 
     def test_triangle_area(self):
-        """Right triangle with legs 1.0 has area 0.5."""
+        """Right triangle: calculate_all_signed_areas matches calculate_area."""
         pts = [Waypoint(0.0, 0.0), Waypoint(1.0, 0.0), Waypoint(0.0, 1.0)]
         areas = Waypoint.calculate_all_signed_areas(pts)
-        self.assertAlmostEqual(abs(areas[2]), 0.5)
+        self.assertAlmostEqual(abs(areas[2]), Waypoint.calculate_area(pts))
 
     def test_square_area(self):
-        """Unit square has area 1.0 at index 3."""
+        """Unit square: areas[0] and areas[1] are zero; areas[3] matches calculate_area."""
         pts = self._make_square(side=1.0)
         areas = Waypoint.calculate_all_signed_areas(pts)
         self.assertEqual(len(areas), 4)
         self.assertEqual(areas[0], 0.0)
         self.assertEqual(areas[1], 0.0)
-        self.assertAlmostEqual(abs(areas[3]), 1.0)
+        self.assertAlmostEqual(abs(areas[3]), Waypoint.calculate_area(pts))
 
     def test_prefix_areas_are_independent(self):
         """areas[i] reflects only the first i+1 points, not later ones."""
         pts = self._make_square(side=2.0)
         areas = Waypoint.calculate_all_signed_areas(pts)
-        # Triangle (first 3 points of a 2×2 square): area = 2.0
-        self.assertAlmostEqual(abs(areas[2]), 2.0)
-        # Full square: area = 4.0
-        self.assertAlmostEqual(abs(areas[3]), 4.0)
+        self.assertAlmostEqual(abs(areas[2]), Waypoint.calculate_area(pts[:3]))
+        self.assertAlmostEqual(abs(areas[3]), Waypoint.calculate_area(pts[:4]))
 
     def test_matches_calculate_area_for_all_prefixes(self):
-        """calculate_all_signed_areas |areas[i]| matches calculate_area on each prefix.
-
-        calculate_area scales to meters²; calculate_all_signed_areas returns degrees².
-        We verify the ratio is constant (cos(lat_mean) * (R * π/180)²) across all prefixes.
-        """
+        """calculate_all_signed_areas matches calculate_area on every prefix (both in meters^2)."""
         pts = [
             Waypoint(lat=36.94588261, lon=28.09343972),
             Waypoint(lat=36.94588981, lon=28.09331353),
@@ -251,16 +245,9 @@ class TestCalculateAllSignedAreas(unittest.TestCase):
         ]
         all_areas = Waypoint.calculate_all_signed_areas(pts)
 
-        R = 6371000
-        scale = (math.radians(R) ** 2)
-
         for i in range(3, len(pts)):
-            prefix = pts[:i + 1]
-            expected_m2 = Waypoint.calculate_area(prefix)
-            lat_mean = sum(w.lat for w in prefix) / len(prefix)
-            # Convert degrees² → meters² using the same scaling as calculate_area
-            computed_m2 = abs(all_areas[i]) * scale * math.cos(math.radians(lat_mean))
-            self.assertAlmostEqual(computed_m2, expected_m2, places=6)
+            expected_m2 = Waypoint.calculate_area(pts[:i + 1])
+            self.assertAlmostEqual(abs(all_areas[i]), expected_m2, places=6)
 
     def test_collinear_points_zero_area(self):
         """Collinear points produce zero area."""
@@ -268,6 +255,49 @@ class TestCalculateAllSignedAreas(unittest.TestCase):
         areas = Waypoint.calculate_all_signed_areas(pts)
         for a in areas:
             self.assertAlmostEqual(a, 0.0)
+
+
+class TestDistance(unittest.TestCase):
+
+    R = 6371000
+    DEG = math.radians(1) * R  # meters per degree at equator
+
+    def test_same_point(self):
+        p = Waypoint(lat=36.9, lon=28.1)
+        self.assertEqual(Waypoint.distance(p, p), 0.0)
+
+    def test_symmetry(self):
+        a = Waypoint(lat=36.9, lon=28.1)
+        b = Waypoint(lat=37.0, lon=28.2)
+        self.assertAlmostEqual(Waypoint.distance(a, b), Waypoint.distance(b, a))
+
+    def test_due_north(self):
+        """1 degree north: pure latitude change, no cos correction."""
+        a = Waypoint(lat=0.0, lon=0.0)
+        b = Waypoint(lat=1.0, lon=0.0)
+        self.assertAlmostEqual(Waypoint.distance(a, b), self.DEG, delta=1)
+
+    def test_due_east_equator(self):
+        """1 degree east at equator: cos(0) = 1, same distance as 1 degree north."""
+        a = Waypoint(lat=0.0, lon=0.0)
+        b = Waypoint(lat=0.0, lon=1.0)
+        self.assertAlmostEqual(Waypoint.distance(a, b), self.DEG, delta=1)
+
+    def test_due_east_60N(self):
+        """1 degree east at 60N: longitude degrees are half as long (cos 60 = 0.5)."""
+        a = Waypoint(lat=60.0, lon=0.0)
+        b = Waypoint(lat=60.0, lon=1.0)
+        self.assertAlmostEqual(Waypoint.distance(a, b), self.DEG * 0.5, delta=1)
+
+    def test_small_distance_vs_geodesic(self):
+        """For a short distance, equirectangular should be within 0.1% of geodesic."""
+        from pyproj import Geod
+        a = Waypoint(lat=36.9459, lon=28.0934)
+        b = Waypoint(lat=36.9560, lon=28.1050)
+        geod = Geod(ellps='WGS84')
+        _, _, geodesic_m = geod.inv(a.lon, a.lat, b.lon, b.lat)
+        approx_m = Waypoint.distance(a, b)
+        self.assertAlmostEqual(approx_m, geodesic_m, delta=geodesic_m * 0.001)
 
 
 class TestCalculateArea(unittest.TestCase):
@@ -313,18 +343,18 @@ class TestCalculateArea(unittest.TestCase):
         self.assertEqual(Waypoint.calculate_area(waypoints), 0.0)
 
     def test_small_rect_equator(self):
-        """0.1°×0.1° square at the equator: within 0.5% of geodesic."""
+        """0.1x0.1 degree square at the equator: within 0.5% of geodesic."""
         self._check_vs_geodesic(self._rect(-0.05, 0.05, 0.0, 0.1))
 
     def test_small_rect_60N(self):
-        """0.1°×0.1° square at 60°N: within 1% of geodesic (sphere vs WGS84 at high lat)."""
+        """0.1x0.1 degree square at 60N: within 1% of geodesic (sphere vs WGS84 at high lat)."""
         self._check_vs_geodesic(self._rect(59.95, 60.05, 0.0, 0.1), tol=0.01)
 
     def test_area_ratio_equator_vs_60N(self):
-        """Area at 60°N should be ~cos(60°)=0.5× the equatorial area for same angular size.
+        """Area at 60N should be ~cos(60deg)=0.5x the equatorial area for same angular size.
 
         Both our spherical approximation and the WGS84 geodesic should be within a few
-        percent of cos(60°). We don't compare them to each other because they use different
+        percent of cos(60deg). We don't compare them to each other because they use different
         Earth models (sphere vs ellipsoid).
         """
         pts_eq  = self._rect(-0.05, 0.05, 0.0, 0.1)
@@ -334,30 +364,8 @@ class TestCalculateArea(unittest.TestCase):
         ratio_geodesic = Waypoint.calculate_geodesic_area(pts_60n) / Waypoint.calculate_geodesic_area(pts_eq)
         # Spherical formula: exact cos(lat) scaling, so ratio should be very close
         self.assertAlmostEqual(ratio_approx, cos60, delta=0.001)
-        # WGS84 geodesic: within 2% (ellipsoid vs sphere difference at 60°N)
+        # WGS84 geodesic: within 2% (ellipsoid vs sphere difference at 60N)
         self.assertAlmostEqual(ratio_geodesic, cos60, delta=0.02)
-
-    def test_matches_calculate_area_for_all_prefixes(self):
-        """calculate_all_signed_areas scaled to m² matches calculate_area on each prefix."""
-        pts = [
-            Waypoint(lat=36.94588261, lon=28.09343972),
-            Waypoint(lat=36.94588981, lon=28.09331353),
-            Waypoint(lat=36.94588261, lon=28.0932955),
-            Waypoint(lat=36.92415369, lon=28.1621126),
-            Waypoint(lat=36.9241681,  lon=28.1621126),
-        ]
-        all_areas = Waypoint.calculate_all_signed_areas(pts)
-
-        R = 6371000
-        scale = (math.radians(R) ** 2)
-
-        for i in range(3, len(pts)):
-            prefix = pts[:i + 1]
-            expected_m2 = Waypoint.calculate_area(prefix)
-            lat_mean = sum(w.lat for w in prefix) / len(prefix)
-            computed_m2 = abs(all_areas[i]) * scale * math.cos(math.radians(lat_mean))
-            self.assertAlmostEqual(computed_m2, expected_m2, places=6)
-
 
 class TestTrackColor(unittest.TestCase):
 
@@ -386,7 +394,7 @@ class TestTrackColor(unittest.TestCase):
             self.assertEqual(trk.color, colors[i])
 
     def test_rgb_to_kml_conversion(self):
-        """RRGGBB → aabbggrr with full opacity."""
+        """RRGGBB -> aabbggrr with full opacity."""
         self.assertEqual(rgb_to_kml('FF0000'), 'ff0000ff')  # red
         self.assertEqual(rgb_to_kml('00FF00'), 'ff00ff00')  # green
         self.assertEqual(rgb_to_kml('0000FF'), 'ffff0000')  # blue
@@ -441,6 +449,121 @@ class TestWriteKML(unittest.TestCase):
         ns = {'kml': 'http://www.opengis.net/kml/2.2'}
         coords = root.find('.//kml:Point/kml:coordinates', ns).text
         self.assertEqual(coords, '28.1,36.9,5.0')
+
+
+class TestCalculateAllConvexAreas(unittest.TestCase):
+
+    def _pts(self, coords):
+        return [Waypoint(lat=lat, lon=lon) for lat, lon in coords]
+
+    def test_short_lists(self):
+        """0, 1, and 2 points return all-zero lists (convex mode)."""
+        for n in (0, 1, 2):
+            pts = [Waypoint(float(i), float(i)) for i in range(n)]
+            areas = Waypoint.calculate_all_convex_areas(pts)
+            self.assertEqual(len(areas), n)
+            self.assertTrue(all(a == 0.0 for a in areas))
+
+    def test_triangle_area(self):
+        """Three non-collinear points: convex area matches calculate_area."""
+        pts = self._pts([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)])
+        areas = Waypoint.calculate_all_convex_areas(pts)
+        self.assertEqual(areas[0], 0.0)
+        self.assertEqual(areas[1], 0.0)
+        self.assertAlmostEqual(areas[2], Waypoint.calculate_area(pts))
+
+    def test_collinear_points_zero_area(self):
+        """All collinear points always give zero area."""
+        pts = self._pts([(0.0, float(i)) for i in range(5)])
+        areas = Waypoint.calculate_all_convex_areas(pts)
+        for a in areas:
+            self.assertEqual(a, 0.0)
+
+    def test_interior_point_does_not_shrink_area(self):
+        """Adding a point strictly inside the hull does not decrease the area."""
+        # Triangle, then add interior point
+        pts = self._pts([(0.0, 0.0), (2.0, 0.0), (1.0, 2.0), (1.0, 0.5)])
+        areas = Waypoint.calculate_all_convex_areas(pts)
+        # area at i=3 should be >= area at i=2 (hull unchanged, only lat_mean drifts slightly)
+        self.assertGreaterEqual(areas[3], areas[2] * 0.99)  # allow 1% for lat_mean drift
+
+    def test_non_decreasing(self):
+        """Convex hull area never decreases as more points are added."""
+        pts = self._pts([
+            (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0),
+            (0.5, 0.5),   # interior
+            (2.0, 0.5),   # exterior -- expands hull
+            (-1.0, 0.5),  # exterior -- expands hull again
+        ])
+        areas = Waypoint.calculate_all_convex_areas(pts)
+        for i in range(1, len(areas)):
+            self.assertGreaterEqual(areas[i], areas[i - 1] - 1e-6)
+
+    def test_square_area_matches_calculate_area(self):
+        """Unit square: convex hull area equals calculate_area of the square."""
+        pts = self._pts([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+        areas = Waypoint.calculate_all_convex_areas(pts)
+        self.assertAlmostEqual(areas[3], Waypoint.calculate_area(pts))
+
+    def test_convex_area_ge_signed_area(self):
+        """Convex hull area >= |signed area| for any point sequence."""
+        pts = self._pts([
+            (0.0, 0.0), (1.0, 0.0), (0.5, 0.5), (1.0, 1.0), (0.0, 1.0)
+        ])
+        convex = Waypoint.calculate_all_convex_areas(pts)
+        signed = Waypoint.calculate_all_signed_areas(pts)
+        for i in range(len(pts)):
+            self.assertGreaterEqual(convex[i] + 1e-9, abs(signed[i]))
+
+    def test_bounding_circle_short_lists(self):
+        """0 and 1 points return all-zero lists with bounding_circle=True."""
+        for n in (0, 1):
+            pts = [Waypoint(float(i), float(i)) for i in range(n)]
+            areas = Waypoint.calculate_all_convex_areas(pts, bounding_circle=True)
+            self.assertEqual(len(areas), n)
+            self.assertTrue(all(a == 0.0 for a in areas))
+
+    def test_bounding_circle_ge_convex(self):
+        """Bounding circle area >= convex hull area at every index."""
+        pts = self._pts([
+            (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0),
+            (0.5, 0.5), (2.0, 0.5),
+        ])
+        convex = Waypoint.calculate_all_convex_areas(pts)
+        circle = Waypoint.calculate_all_convex_areas(pts, bounding_circle=True)
+        for i in range(len(pts)):
+            self.assertGreaterEqual(circle[i] + 1e-9, convex[i])
+
+    def test_bounding_circle_non_decreasing(self):
+        """Bounding circle area never decreases as more points are added."""
+        pts = self._pts([
+            (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0),
+            (0.5, 0.5), (2.0, 0.5), (-1.0, 0.5),
+        ])
+        areas = Waypoint.calculate_all_convex_areas(pts, bounding_circle=True)
+        for i in range(1, len(areas)):
+            self.assertGreaterEqual(areas[i], areas[i - 1] - 1e-6)
+
+    def test_bounding_circle_collinear_nonzero(self):
+        """Collinear points give non-zero bounding circle area once two distinct points exist."""
+        # 5 points along the equator spaced 1 degree apart
+        pts = self._pts([(0.0, float(i)) for i in range(5)])
+        areas = Waypoint.calculate_all_convex_areas(pts, bounding_circle=True)
+        self.assertEqual(areas[0], 0.0)   # single point: no circle
+        for i in range(1, len(areas)):
+            self.assertGreater(areas[i], 0.0)
+
+    def test_bounding_circle_square_ratio(self):
+        """For a unit square at the equator, bounding circle area / convex area = pi/2.
+
+        The square's diagonal is sqrt(2) degrees, so the bounding circle has radius sqrt(2)/2
+        degrees. Area ratio to the square = (pi * (sqrt(2)/2)^2) / 1 = pi/2.
+        """
+        pts = self._pts([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+        convex = Waypoint.calculate_all_convex_areas(pts)
+        circle = Waypoint.calculate_all_convex_areas(pts, bounding_circle=True)
+        ratio = circle[3] / convex[3]
+        self.assertAlmostEqual(ratio, math.pi / 2, delta=0.01)
 
 
 if __name__ == '__main__':

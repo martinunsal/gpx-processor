@@ -63,10 +63,11 @@ class Waypoint:
     sog: float = None
     time: datetime = None
 
-    def distance(self, other):
+    @staticmethod
+    def distance(wp1, wp2):
         "Calculate distance between two waypoints in meters, using equirectangular approximation"
         # Convert latitude and longitude from degrees to radians
-        lat1, lon1, lat2, lon2 = map(math.radians, [self.lat, self.lon, other.lat, other.lon])
+        lat1, lon1, lat2, lon2 = map(math.radians, [wp1.lat, wp1.lon, wp2.lat, wp2.lon])
         lat_mean = (lat1 + lat2) / 2.0
         dlat = lat2 - lat1
         dlon = lon2 - lon1
@@ -94,13 +95,13 @@ class Waypoint:
 
         # Convert the area from degrees squared to meters squared
         R = 6371000  # Radius of the Earth in meters
-        area *= (math.radians(R) ** 2) * math.cos(math.radians(lat_mean))
+        area *= ((math.radians(1) * R) ** 2) * math.cos(math.radians(lat_mean))
 
         return area
 
     @staticmethod
     def calculate_geodesic_area(waypoints: List['Waypoint']) -> float:
-        """Calculate the geodesic area of a polygon in meters² using the WGS84 ellipsoid (via pyproj).
+        """Calculate the geodesic area of a polygon in meters^2 using the WGS84 ellipsoid (via pyproj).
 
         More accurate than calculate_area for large polygons or high latitudes, at higher
         computational cost. Suitable as a reference for validating calculate_area.
@@ -112,30 +113,116 @@ class Waypoint:
         return abs(area)
 
     @staticmethod
-    def calculate_all_signed_areas(waypoints: List['Waypoint']) -> List[float]:
-        """Return a list where areas[i] is the signed shoelace area of waypoints[0..i] (in degrees²).
+    def calculate_all_signed_areas(waypoints: List['Waypoint'], threshold: float = float('inf')) -> List[float]:
+        """Return a list where areas[i] is the signed shoelace area of waypoints[0..i] (in meters^2).
 
         Each consecutive cross-product is computed exactly once and accumulated.
-        The closing term (last point → first point) is O(1) to update per step.
+        The closing term (last point -> first point) is O(1) to update per step.
+        lat_mean is updated incrementally for the geographic scaling at each step.
         Areas[0] and areas[1] are 0.0 (fewer than 3 points cannot form a polygon).
+
+        Exit early if the area exceeds a given threshold
         """
         n = len(waypoints)
-        areas = [0.0] * n
         if n < 3:
-            return areas
+            return [0.0] * n
+
+        R = 6371000
+        scale = (math.radians(1) * R) ** 2
 
         lat0, lon0 = waypoints[0].lat, waypoints[0].lon
-        # Seed with cp_0: cross product of the edge p0→p1
+        lat_sum = lat0 + waypoints[1].lat
+        # Seed with cp_0: cross product of the edge p0->p1
         cumsum = lat0 * waypoints[1].lon - waypoints[1].lat * lon0
+        areas = [0.0] * 2
 
         for i in range(2, n):
             lat_prev, lon_prev = waypoints[i - 1].lat, waypoints[i - 1].lon
             lat_i,    lon_i    = waypoints[i].lat,     waypoints[i].lon
-            # Accumulate cp_{i-1}: cross product of edge p_{i-1}→p_i
+            lat_sum += lat_i
+            # Accumulate cp_{i-1}: cross product of edge p_{i-1}->p_i
             cumsum += lat_prev * lon_i - lat_i * lon_prev
-            # Closing term: edge p_i→p_0
+            # Closing term: edge p_i->p_0
             closing = lat_i * lon0 - lat0 * lon_i
-            areas[i] = 0.5 * (cumsum + closing)
+            lat_mean = lat_sum / (i + 1)
+            area = 0.5 * (cumsum + closing) * scale * math.cos(math.radians(lat_mean))
+            areas.append(area)
+            if abs(area) > threshold:
+                print(f"Area exceeded threshold at index {i}: {area} > {threshold}")
+                break
+
+        return areas
+
+    @staticmethod
+    def calculate_all_hull_areas(waypoints: List['Waypoint'], threshold: float = float('inf'), bounding_circle: bool = False) -> List[float]:
+        """Return a list where areas[i] is the area of the convex hull of waypoints[0..i] (in meters^2).
+
+        Incremental: each step recomputes the hull only from the previous hull vertices plus the
+        new point (not all i+1 points). For GPS tracks where the convex hull H << N total points,
+        cost per step is O(H log H) rather than O(i log i).
+        lat_mean accumulates over all waypoints seen so far for geographic scaling.
+
+        bounding_circle option: use area of bounding circle instead of the actual area of the convex hull
+        Exit early if the area exceeds a given threshold
+        """
+        n = len(waypoints)
+
+        R = 6371000
+        scale = (math.radians(1) * R) ** 2
+
+        def _cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        def _convex_hull(pts):
+            """Andrew's monotone chain on (lat, lon) tuples; returns CCW hull."""
+            pts = sorted(set(pts))
+            if len(pts) < 2:
+                return pts
+            lower = []
+            for p in pts:
+                while len(lower) >= 2 and _cross(lower[-2], lower[-1], p) <= 0:
+                    lower.pop()
+                lower.append(p)
+            upper = []
+            for p in reversed(pts):
+                while len(upper) >= 2 and _cross(upper[-2], upper[-1], p) <= 0:
+                    upper.pop()
+                upper.append(p)
+            return lower[:-1] + upper[:-1]
+
+        hull = []   # current convex hull as (lat, lon) tuples
+        lat_sum = 0.0
+        area = 0.0
+        areas = []
+
+        for i, wp in enumerate(waypoints):
+            p = (wp.lat, wp.lon)
+            lat_sum += wp.lat
+            hull = _convex_hull(hull + [p])
+            m = len(hull)
+            lat_mean = lat_sum / (i + 1)
+            if bounding_circle and m >= 2:
+                # Bounding circle area: pi * r^2 where r = longest hull diameter / 2.
+                # Works for degenerate 2-point hull (collinear points) as well as full polygons.
+                # Convert degrees to meters accounting for latitude compression on longitude.
+                cos_lat = math.cos(math.radians(lat_mean))
+                R_rad = math.radians(1) * R
+                max_dist2 = max(
+                    (hull[j][0] - hull[k][0])**2 * R_rad**2
+                    + (hull[j][1] - hull[k][1])**2 * (R_rad * cos_lat)**2
+                    for j in range(m) for k in range(j + 1, m)
+                )
+                area = math.pi * max_dist2 / 4.0
+            elif not bounding_circle and m >= 3:
+                twice_area_deg2 = abs(sum(
+                    hull[j][0] * hull[(j + 1) % m][1] - hull[(j + 1) % m][0] * hull[j][1]
+                    for j in range(m)
+                ))
+                area = twice_area_deg2 / 2.0 * scale * math.cos(math.radians(lat_mean))
+            areas.append(area)
+            if area > threshold:
+                print(f"{"Bounding circle" if bounding_circle else "Convex hull"} area exceeded threshold at index {i}: {area} > {threshold}")
+                break
 
         return areas
     
@@ -207,12 +294,84 @@ class Track:
             simplified_segments.append(simplified_segment)
         self.segments = simplified_segments
 
-    def prune(self, distance=None, duration=None, count=None):
+    def prune2(self, max_distance: float = 200.0, min_skipped_points: int = 10, from_end: bool = False):
+        """Remove anchored points from the beginning (or end) of each segment."""
+        def anchor_length(segment):
+            peak_velocity_ratio = 0
+            peak_velocity_ratio_index = 0
+            for i in range(min_skipped_points, len(segment)//2):
+                # avoid divide by zero and overly high ratios from very low anchored velocity
+                anchored_distance = max(Waypoint.distance(segment[0], segment[i]), 1.0)
+                moving_distance = Waypoint.distance(segment[i], segment[i*2])
+                if anchored_distance > max_distance:
+                    break
+                anchored_velocity = anchored_distance / abs((segment[i].time - segment[0].time).total_seconds())
+                moving_velocity = moving_distance / abs((segment[i*2].time - segment[i].time).total_seconds())
+                velocity_ratio = moving_velocity / anchored_velocity
+                if velocity_ratio >= peak_velocity_ratio:
+                    peak_velocity_ratio = moving_velocity / anchored_velocity
+                    peak_velocity_ratio_index = i
+                    print(f"New peak velocity ratio: {peak_velocity_ratio:.2f} at index {peak_velocity_ratio_index} (anchored velocity {anchored_velocity:.2f} m/s, moving velocity {moving_velocity:.2f} m/s)")
+            return peak_velocity_ratio_index
+
+        def apply_prune(segment):
+            n = anchor_length(segment)
+            if n > min_skipped_points:
+                centroid_lat = sum(w.lat for w in segment[:n]) / n
+                centroid_lon = sum(w.lon for w in segment[:n]) / n
+                segment[0].lat = centroid_lat
+                segment[0].lon = centroid_lon
+                segment[:] = segment[:1] + segment[n:]
+
         for segment in self.segments:
-            # Any two points less than prune_distance and prune_duration apart (in space and time)
-            # will disqualify all the points in between. So this is our first pass:
-            # TODO(martin): Not yet implemented
-            pass
+            if (from_end):
+                segment.reverse()
+            apply_prune(segment)
+            if from_end:
+                segment.reverse()        
+
+    def prune(self, threshold: float = 10000, smooth_count: int = 5, min_skipped_points: int = 10, from_end: bool = False):
+        """Remove anchor points from the beginning (or end) of each segment.
+        This is an unpleasant pile of heuristic.
+        """
+        def anchor_length(pts):
+            """Return how many points from the start of pts look like idle anchor drifting."""
+            # smoothing to get rid of GPS noise
+            smoothed_pts = []
+            for i in range(len(pts)):
+                start = max(0, i - smooth_count)
+                end = min(len(pts), i + smooth_count + 1)
+                smoothed_lat = sum(p.lat for p in pts[start:end]) / (end - start)
+                smoothed_lon = sum(p.lon for p in pts[start:end]) / (end - start)
+                smoothed_pts.append(Waypoint(smoothed_lat, smoothed_lon))
+            signed_areas = Waypoint.calculate_all_signed_areas(smoothed_pts, threshold)
+            hull_areas = Waypoint.calculate_all_hull_areas(smoothed_pts, threshold)
+            circle_areas = Waypoint.calculate_all_hull_areas(smoothed_pts, threshold, bounding_circle=True)
+            hull_to_circle_ratios = [1.0 if circle < threshold / 10 else hull / circle
+                      for circle, hull in zip(circle_areas, hull_areas)]
+            for hull_to_circle_index, ratio in enumerate(hull_to_circle_ratios):
+                if ratio < 0.1 and hull_to_circle_index >= min_skipped_points - 1:
+                    print(f"Hull to circle ratio dropped below 0.1 at index {hull_to_circle_index}: {ratio}")
+                    break
+            return min(len(signed_areas), len(hull_areas), len(circle_areas), hull_to_circle_index)
+
+        def apply_prune(segment):
+            n = anchor_length(segment)
+            if n <= min_skipped_points:
+                return
+            pruned = segment[:n]
+            centroid_lat = sum(w.lat for w in pruned) / n
+            centroid_lon = sum(w.lon for w in pruned) / n
+            segment[0].lat = centroid_lat
+            segment[0].lon = centroid_lon
+            segment[:] = segment[:1] + segment[n:]
+
+        for segment in self.segments:
+            if (from_end):
+                segment.reverse()
+            apply_prune(segment)
+            if from_end:
+                segment.reverse()
             
     def fill_gaps(self, other, gap_threshold: timedelta):
         filled_segments = []
@@ -443,9 +602,17 @@ def read_and_process(input_file, timezone, args):
         if args.simplify is not None:
             track.simplify(args.simplify)
 
-        # if args.prune:
-        #     track.prune(distance=args.prune_distance, duration=args.prune_duration,
-        #                 count=args.prune_count)
+        if args.prune:
+            print("Pruning start of track: ", track.name)
+            track.prune2(max_distance=args.prune)
+            print("Pruning end of track: ", track.name)
+            track.prune2(max_distance=args.prune, from_end=True)
+
+        if args.drop_count:
+            track.segments = [segment for segment in track.segments if len(segment) >= args.drop_count]
+
+        if args.drop_distance:
+            track.segments = [segment for segment in track.segments if Waypoint.distance(segment[0], segment[-1]) >= args.drop_distance]
 
     if args.split:
         day_segments = defaultdict(list)
@@ -488,6 +655,12 @@ def main():
                         help="Remove points with the exact same timestamp as a previous trackpoint")
     parser.add_argument("--simplify", type=float, default=None,
                         help="Remove point sequences with area less than a threshold in square meters")
+    parser.add_argument("--prune", type=float, default=None,
+                        help="Remove initial point sequences with area less than a threshold in square meters")
+    parser.add_argument("--drop-distance", type=float, default=None,
+                        help="Drop segments whose start and end points are more than this distance in meters apart")
+    parser.add_argument("--drop-count", type=int, default=None,
+                        help="Drop segments with fewer than this many points")
     # parser.add_argument("--prune", action="store_true", default=False, help="Prune idle time")
     # parser.add_argument("--prune-distance", type=float, default=100,
     #                     help="All points must be within this distance in meters to prune")
@@ -536,7 +709,7 @@ def main():
         for i, track in enumerate(gpx_data.tracks):
             track.color = palette[i % len(palette)]
 
-    # Write output — format determined by output file extension
+    # Write output - format determined by output file extension
     ext = args.output_file.rsplit('.', 1)[-1].lower()
     if ext == 'kml':
         write_kml(gpx_data, args.output_file)
